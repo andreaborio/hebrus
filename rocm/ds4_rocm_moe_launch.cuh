@@ -1735,8 +1735,81 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1);
 }
+/* Split a [n_token][n_expert] routed selection into two [n_token][half] halves.
+ * Used to run Qwen's top-8 route as two top-4 passes on the top-6-specialized
+ * ROCm MoE core. */
+__global__ static void moe_split_selected_kernel(
+        int32_t *h0s, int32_t *h1s, float *h0w, float *h1w,
+        const int32_t *sel, const float *w,
+        uint32_t n_token, uint32_t n_expert, uint32_t half) {
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_token) return;
+    for (uint32_t j = 0; j < half; j++) {
+        h0s[t * half + j] = sel[t * n_expert + j];
+        h0w[t * half + j] = w[t * n_expert + j];
+        h1s[t * half + j] = sel[t * n_expert + half + j];
+        h1w[t * half + j] = w[t * n_expert + half + j];
+    }
+}
+
+/* Qwen top-8 as two top-4 halves + add, entirely on device.  gate/up/mid/down
+ * scratch (sized for n_expert by the caller) is reused across the two 4-expert
+ * launches; the two partial outputs are separate temporaries. */
+static int routed_moe_batch_two_half(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens) {
+    const uint32_t half = n_expert / 2u;
+    if (n_expert != 8u || (n_expert & 1u) != 0u) return 0;
+    void *buf = NULL;
+    const size_t sel_bytes = (size_t)n_tokens * half * sizeof(int32_t);
+    const size_t w_bytes = (size_t)n_tokens * half * sizeof(float);
+    const size_t part_bytes = (size_t)n_tokens * out_dim * sizeof(float);
+    const size_t total = 2 * sel_bytes + 2 * w_bytes + 2 * part_bytes;
+    if (cudaMalloc(&buf, total) != cudaSuccess) return 0;
+    char *p = (char *)buf;
+    ds4_gpu_tensor h0s{ p, sel_bytes, 0 }; p += sel_bytes;
+    ds4_gpu_tensor h1s{ p, sel_bytes, 0 }; p += sel_bytes;
+    ds4_gpu_tensor h0w{ p, w_bytes, 0 }; p += w_bytes;
+    ds4_gpu_tensor h1w{ p, w_bytes, 0 }; p += w_bytes;
+    ds4_gpu_tensor part0{ p, part_bytes, 0 }; p += part_bytes;
+    ds4_gpu_tensor part1{ p, part_bytes, 0 };
+    moe_split_selected_kernel<<<(n_tokens + 255u) / 256u, 256>>>(
+        (int32_t *)h0s.ptr, (int32_t *)h1s.ptr, (float *)h0w.ptr, (float *)h1w.ptr,
+        (const int32_t *)selected->ptr, (const float *)weights->ptr, n_tokens, n_expert, half);
+    int ok = cuda_ok(cudaGetLastError(), "qwen moe split");
+    if (ok) ok = routed_moe_launch(&part0, gate, up, mid, down, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, &h0s, &h0w, n_total_expert, half, clamp, x, layer_index, n_tokens);
+    if (ok) ok = routed_moe_launch(&part1, gate, up, mid, down, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, &h1s, &h1w, n_total_expert, half, clamp, x, layer_index, n_tokens);
+    if (ok) ok = ds4_gpu_add_tensor(out, &part0, &part1, n_tokens * out_dim);
+    cudaDeviceSynchronize();
+    cudaFree(buf);
+    return ok;
+}
+
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
+    /* Qwen routes top-8; the shared core is specialized for DeepSeek's top-6.
+     * Run 8 as two top-4 halves + add without touching the sum6 kernels. */
+    if (n_expert > DS4_ROCM_N_EXPERT_USED) {
+        return routed_moe_batch_two_half(out, gate, up, mid, down, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
+    }
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

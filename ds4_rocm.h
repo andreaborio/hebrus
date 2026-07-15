@@ -1,6 +1,15 @@
 #pragma once
 
+/* Opt in to the __shfl_*_sync / __ballot_sync warp builtins, which ROCm 6.3
+ * gates behind this macro (hip/amd_detail/amd_warp_sync_functions.h). The
+ * backend calls __shfl_sync/__shfl_down_sync with an 8-byte MASK_T mask. */
+#define HIP_ENABLE_WARP_SYNC_BUILTINS 1
+
 #include <hip/hip_runtime.h>
+/* hipBLAS 2.x hides the hipDataType-based GemmEx/GemmStridedBatchedEx behind
+ * HIPBLAS_V2; without it only the deprecated hipblasDatatype_t overloads are
+ * declared and the CUDA_R_* (now hipDataType) arguments don't match. */
+#define HIPBLAS_V2
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
@@ -79,8 +88,11 @@
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_TF32_TENSOR_OP_MATH HIPBLAS_TF32_TENSOR_OP_MATH
-#define CUDA_R_16F HIPBLAS_R_16F
-#define CUDA_R_32F HIPBLAS_R_32F
+/* hipBLAS 2.x (ROCm 6.3) hipblasGemmEx/GemmStridedBatchedEx take hipDataType
+ * (HIP_R_*), not the deprecated hipblasDatatype_t (HIPBLAS_R_*). The compute
+ * type stays hipblasComputeType_t (HIPBLAS_COMPUTE_32F). */
+#define CUDA_R_16F HIP_R_16F
+#define CUDA_R_32F HIP_R_32F
 
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
@@ -91,6 +103,13 @@
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 
 namespace cub = hipcub;
+
+/* CUDA's __syncwarp has no HIP equivalent (not provided even with
+ * HIP_ENABLE_WARP_SYNC_BUILTINS on ROCm 6.3). On RDNA3 wave32 the lanes of a
+ * wave execute in lockstep, so warp reconvergence is implicit; a wavefront-
+ * scoped fence supplies the compiler ordering the call is relied on for.
+ * Variadic so both __syncwarp() and __syncwarp(mask) map through. */
+#define __syncwarp(...) __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront")
 
 static __device__ __forceinline__ int32_t __vcmpne4(uint32_t a, uint32_t b) {
     // For each byte: 0xFF if a != b, 0x00 if a == b

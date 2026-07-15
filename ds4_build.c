@@ -2,9 +2,14 @@
 
 #include <string.h>
 
+/* The Makefile passes DS4_BUILD_GIT_SHA as a bare token (no embedded quotes):
+ * quoted -D values lose their quotes in recursive targets, where CFLAGS goes
+ * through one extra shell evaluation. Stringify it here instead. */
 #ifndef DS4_BUILD_GIT_SHA
-#define DS4_BUILD_GIT_SHA "unknown"
+#define DS4_BUILD_GIT_SHA unknown
 #endif
+#define DS4_BUILD_STR2(x) #x
+#define DS4_BUILD_STR(x) DS4_BUILD_STR2(x)
 
 const char *ds4_build_backend(void) {
 #ifdef DS4_NO_GPU
@@ -29,7 +34,7 @@ const char *ds4_build_arch(void) {
 }
 
 const char *ds4_build_git_sha(void) {
-    return DS4_BUILD_GIT_SHA;
+    return DS4_BUILD_STR(DS4_BUILD_GIT_SHA);
 }
 
 void ds4_build_info_print(FILE *fp) {

@@ -12,7 +12,19 @@ static int g_model_cache_full;
 static int g_ssd_streaming_mode;
 static cudaStream_t g_model_upload_stream;
 static cudaStream_t g_selected_readback_stream;
-static cudaEvent_t g_selected_readback_event;
+/*
+ * Selected-id readback events form a small ring indexed by the monotonically
+ * increasing event value.  A single shared event object is not safe here:
+ * three threads (decode encoder, single-token async load worker, batch async
+ * load worker) record and wait concurrently under MTP speculative decoding,
+ * and on HIP re-recording an event while a hipStreamWaitEvent from an earlier
+ * record is still pending resets the underlying HSA signal — the pending
+ * barrier then never fires and the readback stream wedges (observed as a
+ * permanent hipDeviceSynchronize hang with an idle GPU).  Per-value slots keep
+ * every pending wait bound to its own record.
+ */
+#define DS4_SELECTED_READBACK_EVENT_RING 8u
+static cudaEvent_t g_selected_readback_events[DS4_SELECTED_READBACK_EVENT_RING];
 static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
@@ -25,6 +37,9 @@ enum {
     DS4_ROCM_N_EXPERT = 256u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
     DS4_ROCM_N_EXPERT_USED = 6u,
+    /* 36 workers were tried for MTP verify unions (no measured gain — the
+     * load is latency-bound, not queue-depth-bound) and reverted: more
+     * concurrent GPU-touching threads widen the HSA-wedge race window. */
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
     DS4_ROCM_STREAM_READ_MAX_JOBS = DS4_ROCM_MAX_N_EXPERT * 3u,
     DS4_ROCM_COMPRESSOR_MAX_RATIO = 128u
@@ -314,8 +329,215 @@ static void cuda_stream_cache_stats_note_resident(void) {
     }
 }
 
+/* ----------------------------------------------------------------------
+ * Host-RAM LFU expert-slice cache (Phase 3)
+ *
+ * The per-expert streaming read path (cuda_stream_read_job_run) issues a
+ * buffered pread and then drops the OS page cache for that range
+ * (cuda_model_drop_file_pages / FADV_DONTNEED), so the kernel keeps NO RAM
+ * copy of routed experts.  This cache is the only RAM tier between the
+ * 16-GiB-class GTT resident cache and the ~5 GB/s NVMe: it holds pageable
+ * copies of raw file bytes keyed by their file offset (which uniquely
+ * identifies a gate/up/down expert slice, model map is read-only/immutable),
+ * so a repeat demand-load is served from RAM (~90 GB/s) instead of the SSD.
+ *
+ * Policy: LFU with a last-used tiebreak (popular experts survive regardless
+ * of recency, which suits MoE routing skew).  Thread-safe: the read-worker
+ * pool calls get()/insert() from up to DS4_ROCM_STREAM_READ_WORKERS threads,
+ * all serialized on g_host_cache_mutex.  Budget: DS4_ROCM_HOST_CACHE_GB
+ * (0 disables; default scales to available RAM, capped at 12 GiB), clamped
+ * to 60%% of MemAvailable so it never fights the OS/JARVIS for RAM.
+ * -------------------------------------------------------------------- */
+struct ds4_host_cache_entry {
+    void *data;
+    uint64_t bytes;
+    uint64_t freq;
+    uint64_t last;
+};
+static std::unordered_map<uint64_t, ds4_host_cache_entry> g_host_cache;
+static pthread_mutex_t g_host_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_host_cache_budget = 0;   /* 0 until initialized */
+static uint64_t g_host_cache_bytes = 0;
+static uint64_t g_host_cache_clock = 0;
+static int g_host_cache_ready = 0;
+static uint64_t g_host_cache_hits = 0;
+static uint64_t g_host_cache_misses = 0;
+static uint64_t g_host_cache_inserts = 0;
+static uint64_t g_host_cache_evictions = 0;
+
+static uint64_t cuda_host_cache_mem_available_bytes(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char key[64];
+    unsigned long long val = 0;
+    char unit[16];
+    uint64_t avail = 0;
+    while (fscanf(f, "%63s %llu %15s", key, &val, unit) == 3) {
+        if (strcmp(key, "MemAvailable:") == 0) { avail = (uint64_t)val * 1024ull; break; }
+    }
+    fclose(f);
+    return avail;
+}
+
+/* Must be called with g_host_cache_mutex held. */
+static void cuda_host_cache_init_locked(void) {
+    if (g_host_cache_ready) return;
+    g_host_cache_ready = 1;
+    /* Default OFF: on DeepSeek V4 Flash the per-token routed-expert working set
+     * (~72 GiB) dwarfs any RAM cache that fits alongside JARVIS, so a sub-model
+     * cache yields a low hit rate and its bookkeeping can cost more than it
+     * saves.  Opt in with DS4_ROCM_HOST_CACHE_GB when the cache can hold a large
+     * fraction of the working set (more RAM) or the workload has higher expert
+     * reuse.  See LABESTIA_DESIGN.md Sec.Q3. */
+    uint64_t budget = 0;
+    const char *env = getenv("DS4_ROCM_HOST_CACHE_GB");
+    if (env && *env) {
+        char *end = NULL;
+        const double gb = strtod(env, &end);
+        if (end && *end == '\0' && gb >= 0.0) {
+            budget = (uint64_t)(gb * 1073741824.0);
+        } else {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "ignoring invalid DS4_ROCM_HOST_CACHE_GB=\"%s\"\n", env);
+        }
+    }
+    /* Never take more than 40% of currently-available RAM: the buffered-pread
+     * fallback and the OS still need page cache, and on this 47 GiB box shared
+     * with JARVIS a larger cache pushes the system into reclaim/swap and
+     * *regresses* throughput hard (measured: a ~19 GiB resident cache dropped
+     * generation from ~1.9 to ~0.5 t/s).  Keep the cache well clear of that. */
+    const uint64_t avail = cuda_host_cache_mem_available_bytes();
+    if (avail) {
+        const uint64_t cap = avail / 10ull * 4ull;
+        if (budget > cap) budget = cap;
+    }
+    g_host_cache_budget = budget;
+    if (budget) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "host expert cache enabled: %.2f GiB budget\n",
+                (double)budget / 1073741824.0);
+    }
+}
+
+/* On hit, copies bytes into dst and returns 1.  Thread-safe. */
+static int cuda_host_cache_get(uint64_t offset, uint64_t bytes, void *dst) {
+    int hit = 0;
+    pthread_mutex_lock(&g_host_cache_mutex);
+    cuda_host_cache_init_locked();
+    if (g_host_cache_budget) {
+        std::unordered_map<uint64_t, ds4_host_cache_entry>::iterator it =
+            g_host_cache.find(offset);
+        if (it != g_host_cache.end() && it->second.bytes == bytes) {
+            memcpy(dst, it->second.data, (size_t)bytes);
+            it->second.freq++;
+            it->second.last = ++g_host_cache_clock;
+            g_host_cache_hits++;
+            hit = 1;
+        } else {
+            g_host_cache_misses++;
+        }
+    }
+    pthread_mutex_unlock(&g_host_cache_mutex);
+    return hit;
+}
+
+/* Inserts a private copy of src.  Evicts LFU victims to stay under budget. */
+static void cuda_host_cache_insert(uint64_t offset, uint64_t bytes, const void *src) {
+    if (bytes == 0) return;
+    pthread_mutex_lock(&g_host_cache_mutex);
+    cuda_host_cache_init_locked();
+    if (!g_host_cache_budget || bytes > g_host_cache_budget ||
+        g_host_cache.find(offset) != g_host_cache.end()) {
+        pthread_mutex_unlock(&g_host_cache_mutex);
+        return;
+    }
+    while (g_host_cache_bytes + bytes > g_host_cache_budget && !g_host_cache.empty()) {
+        /* Sampled LFU: evicting the true global minimum is O(N) per eviction,
+         * which serializes the 18 read workers under heavy thrash and erases
+         * the cache's benefit.  Instead sample a bounded window of buckets
+         * (rotating start so coverage spreads) and evict the min-freq entry
+         * found — O(window), a good LFU approximation. */
+        const size_t nbuckets = g_host_cache.bucket_count();
+        const size_t start = nbuckets ? (size_t)(g_host_cache_clock % nbuckets) : 0;
+        uint64_t victim_key = 0;
+        int have_victim = 0;
+        uint64_t best_freq = UINT64_MAX;
+        uint64_t best_last = UINT64_MAX;
+        int sampled = 0;
+        for (size_t b = 0; b < nbuckets && sampled < 32; b++) {
+            const size_t bi = (start + b) % nbuckets;
+            for (std::unordered_map<uint64_t, ds4_host_cache_entry>::local_iterator lit =
+                     g_host_cache.begin(bi); lit != g_host_cache.end(bi); ++lit) {
+                if (!have_victim || lit->second.freq < best_freq ||
+                    (lit->second.freq == best_freq && lit->second.last < best_last)) {
+                    best_freq = lit->second.freq;
+                    best_last = lit->second.last;
+                    victim_key = lit->first;
+                    have_victim = 1;
+                }
+                if (++sampled >= 32) break;
+            }
+        }
+        if (!have_victim) break;
+        std::unordered_map<uint64_t, ds4_host_cache_entry>::iterator v =
+            g_host_cache.find(victim_key);
+        if (v == g_host_cache.end()) break;
+        free(v->second.data);
+        g_host_cache_bytes -= v->second.bytes;
+        g_host_cache.erase(v);
+        g_host_cache_evictions++;
+    }
+    void *copy = malloc((size_t)bytes);
+    if (copy) {
+        memcpy(copy, src, (size_t)bytes);
+        ds4_host_cache_entry e;
+        e.data = copy;
+        e.bytes = bytes;
+        e.freq = 1;
+        e.last = ++g_host_cache_clock;
+        g_host_cache[offset] = e;
+        g_host_cache_bytes += bytes;
+        g_host_cache_inserts++;
+        /* Periodic frequency decay so a burst-popular expert cannot squat the
+         * cache forever (LFU aging), mirroring the reference implementation. */
+        if ((g_host_cache_inserts & 4095ull) == 0ull) {
+            for (std::unordered_map<uint64_t, ds4_host_cache_entry>::iterator it =
+                     g_host_cache.begin(); it != g_host_cache.end(); ++it) {
+                it->second.freq >>= 1;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_host_cache_mutex);
+}
+
+static void cuda_host_cache_release(void) {
+    pthread_mutex_lock(&g_host_cache_mutex);
+    for (std::unordered_map<uint64_t, ds4_host_cache_entry>::iterator it =
+             g_host_cache.begin(); it != g_host_cache.end(); ++it) {
+        free(it->second.data);
+    }
+    g_host_cache.clear();
+    g_host_cache_bytes = 0;
+    pthread_mutex_unlock(&g_host_cache_mutex);
+}
+
 static void cuda_stream_cache_stats_print(const char *label) {
     if (!cuda_stream_cache_stats_on()) return;
+    if (g_host_cache_budget) {
+        const uint64_t total = g_host_cache_hits + g_host_cache_misses;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "host cache stats %s: "
+                "hits=%llu misses=%llu hit_rate=%.1f%% inserts=%llu "
+                "evictions=%llu resident=%.2f/%.2f GiB\n",
+                label ? label : "",
+                (unsigned long long)g_host_cache_hits,
+                (unsigned long long)g_host_cache_misses,
+                total ? 100.0 * (double)g_host_cache_hits / (double)total : 0.0,
+                (unsigned long long)g_host_cache_inserts,
+                (unsigned long long)g_host_cache_evictions,
+                (double)g_host_cache_bytes / 1073741824.0,
+                (double)g_host_cache_budget / 1073741824.0);
+    }
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "stream cache stats %s: "
             "selected calls=%llu slots=%llu hits=%llu misses=%llu; "
@@ -506,6 +728,7 @@ static void cuda_stream_read_stage_release(void) {
             g_stream_read_upload_streams[i] = NULL;
         }
     }
+    cuda_host_cache_release();
 }
 
 static void cuda_stream_batch_selected_cache_release(void) {
@@ -969,8 +1192,111 @@ static int cuda_stream_resident_evict_one(
     return 1;
 }
 
+/* Device bytes kept free for the KV cache, BLAS workspaces, transient graph
+ * buffers, and other processes sharing the GPU pool.  The reserve was
+ * historically a flat 16 GiB, sized for machines whose hipMemGetInfo() total
+ * is a ~110 GiB GTT aperture (Strix Halo class).  On devices with a small
+ * pool (e.g. Phoenix APUs whose ROCm pool is the ~24 GiB GTT) a flat 16 GiB
+ * starves the streaming expert cache to zero, so the default scales with the
+ * pool and DS4_ROCM_STREAM_RESERVE_MB overrides it explicitly. */
 static uint64_t cuda_stream_resident_free_reserve_bytes(void) {
-    return 16ull * 1024ull * 1024ull * 1024ull;
+    static uint64_t cached_reserve = UINT64_MAX;
+    if (cached_reserve != UINT64_MAX) return cached_reserve;
+
+    const char *env = getenv("DS4_ROCM_STREAM_RESERVE_MB");
+    if (env && *env) {
+        char *end = NULL;
+        const unsigned long long mb = strtoull(env, &end, 10);
+        if (end && *end == '\0' && mb <= (UINT64_MAX >> 20)) {
+            cached_reserve = (uint64_t)mb << 20;
+            return cached_reserve;
+        }
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "ignoring invalid DS4_ROCM_STREAM_RESERVE_MB=\"%s\"\n",
+                env);
+    }
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && total_b > 0) {
+        (void)free_b;
+        /*
+         * Adaptive default.  On UMA APUs the GTT pool is ordinary system RAM:
+         * if the expert cache grows until only a thin slice of the pool is
+         * free while the rest of the system is also tight, the kernel's TTM
+         * starts evicting GPU queue buffers ("Freeing queue vital buffer,
+         * queue evicted" + "Not enough memory for command submission!" in
+         * dmesg) and every later HIP sync blocks forever with an idle GPU.
+         * A fixed pool fraction cannot see any of that, so derive the floor
+         * from the host memory that is actually available at startup:
+         *
+         *   headroom = max(4 GiB, MemTotal/12)   (co-tenant + kernel margin)
+         *   reserve  = pool_total - (MemAvailable - headroom)
+         *
+         * i.e. the cache may consume at most what the host can spare beyond
+         * the headroom; everything else stays free inside the pool.  On the
+         * 64 GB / 48 GiB-GTT reference box this reproduces the empirically
+         * validated 14 GiB floor (250/300-token soaks clean vs reliable
+         * mid-generation freezes with the old pool/8 = 6 GiB default).
+         */
+        uint64_t mem_total = 0;
+        uint64_t mem_available = 0;
+#if defined(__linux__)
+        FILE *mi = fopen("/proc/meminfo", "r");
+        if (mi) {
+            char line[128];
+            while (fgets(line, sizeof(line), mi)) {
+                unsigned long long kb = 0;
+                if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+                    mem_total = (uint64_t)kb << 10;
+                } else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                    mem_available = (uint64_t)kb << 10;
+                }
+                if (mem_total && mem_available) break;
+            }
+            fclose(mi);
+        }
+#endif
+        /*
+         * The floor is also a THROUGHPUT optimum, not only a safety line: on
+         * UMA boxes every GiB the expert cache wires is a GiB of page cache
+         * the 80 GB model file loses, and streaming reads slow down more than
+         * the extra residency gains (measured: a 6.6 GiB floor grew the cache
+         * and LOST ~10%% generation vs the 14 GiB floor on the same box).
+         * pool/4 keeps the fresh-state floor near the measured optimum while
+         * the host-aware term above still raises it when RAM is tight.
+         */
+        const uint64_t min_reserve =
+            (uint64_t)total_b / 4u > (2ull << 30) ? (uint64_t)total_b / 4u
+                                                  : (2ull << 30);
+        const uint64_t max_reserve = (uint64_t)total_b / 2u;
+        uint64_t reserve;
+        if (mem_total && mem_available) {
+            uint64_t headroom = mem_total / 12u;
+            if (headroom < (4ull << 30)) headroom = 4ull << 30;
+            const uint64_t allowed =
+                mem_available > headroom ? mem_available - headroom : 0;
+            reserve = (uint64_t)total_b > allowed ? (uint64_t)total_b - allowed
+                                                  : min_reserve;
+        } else {
+            /* No /proc/meminfo (or non-Linux): legacy pool/8 default. */
+            reserve = (uint64_t)total_b / 8u;
+        }
+        if (reserve < min_reserve) reserve = min_reserve;
+        if (reserve > max_reserve) reserve = max_reserve;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming cache free-floor: %.2f GiB "
+                "(pool %.2f GiB, host available %.2f GiB; "
+                "DS4_ROCM_STREAM_RESERVE_MB overrides)\n",
+                (double)reserve / 1073741824.0,
+                (double)total_b / 1073741824.0,
+                (double)mem_available / 1073741824.0);
+        cached_reserve = reserve;
+        return cached_reserve;
+    }
+    (void)cudaGetLastError();
+    cached_reserve = 16ull << 30;
+    return cached_reserve;
 }
 
 static int cuda_stream_resident_make_room(
@@ -1138,12 +1464,30 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job) {
         if (job) job->errnum = EINVAL;
         return;
     }
+    /* (a) Serve from the host RAM cache if present (copies under the cache
+     * lock, so no eviction race), skipping the NVMe read entirely. */
+    if (cuda_host_cache_get(job->offset, job->bytes, job->host_buf)) {
+        job->ok = 1;
+        return;
+    }
     if (cuda_pread_full(g_model_fd, job->host_buf, job->bytes, job->offset)) {
         job->ok = 1;
+        /* (b) Populate the host cache with a private copy (host_buf is the
+         * shared per-worker pinned staging buffer, so we must not donate it). */
+        cuda_host_cache_insert(job->offset, job->bytes, job->host_buf);
     } else {
         job->errnum = errno ? errno : EIO;
     }
 }
+
+/* GPU uploads from the read workers are serialized: concurrent
+ * cudaMemcpyAsync+cudaStreamSynchronize pairs from many pool threads
+ * (while the encoder thread issues its own device syncs) intermittently
+ * wedge the HSA queues on this ROCm/APU stack — observed as generation
+ * freezing mid-request with one thread spinning and zero disk traffic,
+ * with worker stacks parked in this stream sync.  The SSD preads stay
+ * fully parallel; the serialized H2D copies amount to ~1 ms per layer. */
+static pthread_mutex_t g_stream_read_upload_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int cuda_stream_read_job_upload(
         cuda_stream_read_job *job,
@@ -1152,12 +1496,14 @@ static int cuda_stream_read_job_upload(
         if (job) job->errnum = EINVAL;
         return 0;
     }
+    pthread_mutex_lock(&g_stream_read_upload_mutex);
     cudaError_t err = cudaMemcpyAsync(job->dst,
                                       job->host_buf,
                                       (size_t)job->bytes,
                                       cudaMemcpyHostToDevice,
                                       stream);
     if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+    pthread_mutex_unlock(&g_stream_read_upload_mutex);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "streaming read-worker upload failed: %s\n",
@@ -3383,10 +3729,28 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && end >= offset && bytes <= r.bytes &&
+            !r.host_registered) {
+            return r.device_ptr;
+        }
+    }
+    /*
+     * Prefer device-resident copies over host-registered mmap windows: the
+     * GPU reads registered host pages at ~7-8 GB/s on this APU (measured on
+     * the attention output projections), an order of magnitude slower than
+     * GTT-resident copies.  Host-registered ranges created early (prefill
+     * runs before the static decode map install) must not shadow the device
+     * copies installed later.
+     */
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && !r.host_registered &&
+            offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
     }
     for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+        if (r.host_base == model_map && r.host_registered &&
+            offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -3460,6 +3824,77 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+    g_model_range_bytes += bytes;
+    return (const char *)dev;
+}
+
+/*
+ * Materialize a device-resident copy of a model range, bypassing (and then
+ * retiring) any host-registered mmap window that covers it.  Used by the
+ * streaming span installs: weights that stay hot on the GPU (attention
+ * projections, MTP draft tables) must not be served from registered host
+ * pages (~7-8 GB/s reads on this APU vs GTT-resident copies).
+ */
+static const char *cuda_model_range_ptr_device(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
+    if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    if (cuda_model_image_owned(model_map)) return cuda_model_ptr(model_map, offset);
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && !r.host_registered &&
+            offset >= r.offset && end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
+    }
+
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "device model range alloc failed for %s (%.2f MiB): %s\n",
+                what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        return NULL;
+    }
+    const char *src = (const char *)model_map + offset;
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "device model range copy failed for %s: %s\n",
+                    what ? what : "weights", cudaGetErrorString(err));
+            (void)cudaFree(dev);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+    }
+
+    /* Retire host-registered windows now shadowed by the device copy: they
+     * would only pin page-cache RAM.  Entries fully inside [offset,end) go
+     * away; partial overlaps are kept (still needed for their tails). */
+    size_t w = 0;
+    for (size_t i = 0; i < g_model_ranges.size(); i++) {
+        cuda_model_range &r = g_model_ranges[i];
+        const int retire =
+            r.host_base == model_map && r.host_registered &&
+            r.offset >= offset && r.offset + r.bytes <= end;
+        if (retire) {
+            if (r.registered_base) (void)cudaHostUnregister(r.registered_base);
+            continue;
+        }
+        if (w != i) g_model_ranges[w] = g_model_ranges[i];
+        w++;
+    }
+    if (w != g_model_ranges.size()) {
+        g_model_ranges.resize(w);
+        g_model_range_by_offset.clear();
+        for (size_t i = 0; i < g_model_ranges.size(); i++) {
+            g_model_range_by_offset[g_model_ranges[i].offset] = i;
+        }
+    }
+
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
@@ -4003,6 +4438,14 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 }
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+    /* By default we drop the page cache for each streamed range so the 81 GB
+     * model does not evict everything else on a RAM-tight box.  When there is
+     * spare RAM (e.g. after shrinking the BIOS VRAM carve), keeping the pages
+     * lets the OS page cache act as a free, self-evicting (never-OOM) host
+     * cache for hot experts at ~RAM speed.  DS4_ROCM_KEEP_PAGE_CACHE=1 opts in. */
+    static int keep = -1;
+    if (keep < 0) keep = getenv("DS4_ROCM_KEEP_PAGE_CACHE") != NULL ? 1 : 0;
+    if (keep) return;
 #if defined(POSIX_FADV_DONTNEED)
     if (g_model_fd < 0 || bytes == 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
@@ -4451,9 +4894,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_selected_readback_stream);
         g_selected_readback_stream = NULL;
     }
-    if (g_selected_readback_event) {
-        (void)cudaEventDestroy(g_selected_readback_event);
-        g_selected_readback_event = NULL;
+    for (uint32_t i = 0; i < DS4_SELECTED_READBACK_EVENT_RING; i++) {
+        if (g_selected_readback_events[i]) {
+            (void)cudaEventDestroy(g_selected_readback_events[i]);
+            g_selected_readback_events[i] = NULL;
+        }
     }
     g_selected_readback_event_value = 0;
     cuda_model_image_release_all();
@@ -4607,7 +5052,22 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     const int multi_model =
         g_model_host_base != NULL &&
         (g_model_host_base != model_map || g_model_registered_size != model_size);
-    cuda_model_range_release_all();
+    const int same_map_resized =
+        g_model_host_base == model_map && g_model_registered_size != model_size;
+    if (!multi_model || same_map_resized) {
+        /* First registration, or the same mapping re-registered with a new
+         * size (a genuine remap): cached ranges for it are stale. */
+        cuda_model_range_release_all();
+    }
+    /*
+     * Cached model ranges are keyed by (host_base, offset), so mappings for
+     * several models (main + MTP support model) can coexist in the registry.
+     * Do NOT release them when switching between live mappings: the streaming
+     * session re-registers the main model spans after the MTP model loads,
+     * and releasing here would evict the MTP draft's device-resident expert
+     * tables (routed MoE then fails per token at decode time).  The full
+     * release still happens in ds4_gpu_cleanup() at engine close.
+     */
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;

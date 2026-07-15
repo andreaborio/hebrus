@@ -381,6 +381,47 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
+/*
+ * Small-batch (2-4 token) prequantized matmul: one warp per output row, the
+ * row's weight blocks are read ONCE and applied to every token's quantized
+ * activations.  The per-token grid kernels re-read the full weight matrix for
+ * each token, which is what made the MTP verify's attention/Q projections
+ * n-times more expensive than a single-token decode.
+ */
+__global__ static void matmul_q8_0_preq_rows_w32_ntok_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t rows_per_block,
+        uint32_t n_tok,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || n_tok > 4u) return;
+    const unsigned char *wr = w + row * blocks * 34u;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34u);
+        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+        const float ws = __half2float(*scale_h);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const int8_t *xqb = xq + ((uint64_t)t * blocks + b) * 32u;
+            const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc[t] += ws * xscale[(uint64_t)t * blocks + b] * (float)dot;
+        }
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float v = warp_sum_f32(acc[t]);
+        if (lane == 0u) out[(uint64_t)t * out_dim + row] = v;
+    }
+}
+
 __device__ static float q8_0_scale_scalar(const unsigned char *blk) {
     const uint16_t bits = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
     return __half2float(__ushort_as_half((unsigned short)bits));

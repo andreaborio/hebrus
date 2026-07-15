@@ -128,4 +128,6 @@ typedef struct {
 
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
+#include "rocm/ds4_rocm_qwen.cuh"
+
 #include "rocm/ds4_rocm_current_api_compat.cuh"

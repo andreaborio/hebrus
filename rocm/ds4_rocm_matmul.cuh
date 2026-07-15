@@ -293,6 +293,47 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
         }
 #endif
+        /*
+         * Small batches (MTP verify suffixes, 2-4 tokens): both per-token grid
+         * kernels (weights re-read once PER TOKEN) and the sharedx tiles
+         * (sized for 16-token tiles) waste most of their bandwidth here.
+         * Quantize the activations once and run the ntok kernel, which reads
+         * each weight row once for all tokens — the same trick that makes the
+         * single-token decode path fast.  DS4_ROCM_SMALLN_SHAREDX restores the
+         * old dispatch for comparison.
+         */
+        const int smalln_preq =
+            n_tok <= 4u && getenv("DS4_ROCM_SMALLN_SHAREDX") == NULL;
+        if (smalln_preq) {
+            const uint64_t xq_bytes = n_tok * blocks * 32u;
+            const uint64_t scale_off = (xq_bytes + 15u) & ~15ull;
+            const uint64_t tmp_bytes = scale_off + n_tok * blocks * sizeof(float);
+            void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 smalln prequant");
+            if (tmp) {
+                int8_t *xq = (int8_t *)tmp;
+                float *xscale = (float *)((char *)tmp + scale_off);
+                dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+                quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+                if (cuda_ok(cudaGetLastError(), "matmul_q8_0 smalln quantize launch")) {
+                    const uint32_t rpb = 8u;
+                    matmul_q8_0_preq_rows_w32_ntok_kernel<<<
+                            (unsigned)((out_dim + rpb - 1u) / rpb),
+                            rpb * 32u>>>(
+                            (float *)out->ptr,
+                            reinterpret_cast<const unsigned char *>(wptr),
+                            xq,
+                            xscale,
+                            in_dim,
+                            out_dim,
+                            blocks,
+                            rpb,
+                            (uint32_t)n_tok,
+                            1);
+                    return cuda_ok(cudaGetLastError(), "matmul_q8_0 smalln ntok launch");
+                }
+            }
+            /* fall through to the generic paths on alloc/launch failure */
+        }
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
             const uint32_t tile = 32u;

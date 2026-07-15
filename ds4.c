@@ -78,6 +78,25 @@ static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
 
+/* The Qwen3.6 GPU runtime is Apple Metal today; the ROCm build reuses the
+ * legacy metal_graph_* graph backend, which presents at runtime as the CUDA
+ * backend enum (ds4_build_backend() still reports "rocm").  This helper marks
+ * the graph backend that carries the Qwen GPU path for the current build so
+ * the many backend equality checks stay in one place. */
+#if defined(__APPLE__) || (defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
+#define DS4_QWEN_GPU_BUILD 1
+#endif
+static bool ds4_backend_is_qwen_gpu(ds4_backend backend) {
+#if defined(__APPLE__)
+    return backend == DS4_BACKEND_METAL;
+#elif defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    return backend == DS4_BACKEND_CUDA;
+#else
+    (void)backend;
+    return false;
+#endif
+}
+
 static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
     if (backend == DS4_BACKEND_CUDA) {
@@ -12665,7 +12684,7 @@ void ds4_internal_qwen35_gpu_graph_free(
     qwen35_gpu_graph_free(storage);
 }
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
 /* =========================================================================
  * Qwen3.6 Metal one-token forward.
  * =========================================================================
@@ -14018,7 +14037,7 @@ static DS4_MAYBE_UNUSED bool qwen35_gpu_forward_token(
     return qwen35_gpu_forward_token_commands(
         logits, model, weights, graph, token, position, false, true);
 }
-#endif /* __APPLE__ */
+#endif /* __APPLE__ || DS4_ROCM_BUILD */
 
 /* =========================================================================
  * Metal Release Graph State.
@@ -28503,7 +28522,7 @@ struct ds4_session {
     ds4_dist_session *distributed;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
-#if defined(__APPLE__)
+#ifdef DS4_QWEN_GPU_BUILD
     ds4_qwen35_gpu_graph qwen35_gpu_graph;
 #endif
 #endif
@@ -28839,7 +28858,7 @@ static bool ds4_session_is_qwen35_cpu(const ds4_session *s) {
 static DS4_MAYBE_UNUSED bool ds4_session_is_qwen35_metal(
         const ds4_session *s) {
     return ds4_session_is_qwen35(s) && s->engine->qwen_metal_runtime &&
-           s->engine->backend == DS4_BACKEND_METAL;
+           ds4_backend_is_qwen_gpu(s->engine->backend);
 }
 
 static uint32_t ds4_session_vocab_size(const ds4_session *s) {
@@ -28888,7 +28907,7 @@ static bool ds4_session_qwen35_timeline_valid(const ds4_session *s) {
     if (ds4_session_is_qwen35_cpu(s)) {
         return s->qwen35_cpu_cache.n_tokens == checkpoint_len;
     }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
     if (ds4_session_is_qwen35_metal(s)) {
         return s->qwen35_gpu_graph.state_valid &&
                s->qwen35_gpu_graph.n_tokens == checkpoint_len;
@@ -28902,7 +28921,7 @@ static bool ds4_session_qwen35_reset_timeline(ds4_session *s) {
     bool ok = true;
     if (ds4_session_is_qwen35_cpu(s)) {
         ds4_qwen35_cpu_cache_reset(&s->qwen35_cpu_cache);
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
     } else if (ds4_session_is_qwen35_metal(s)) {
         /* qwen35_gpu_forward_token already performs a full reset after any
          * late, state-mutating failure.  Avoid zeroing the entire context a
@@ -31037,11 +31056,18 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return true;
     }
 
-    if (e->backend != DS4_BACKEND_METAL) {
+    /* The adaptive planner is capability-gated, not backend-gated: any
+     * backend that can produce a live host-memory snapshot gets the adaptive
+     * budget (ROCm UMA APUs need it as much as Metal does — without a
+     * host-aware floor the kernel TTM can evict the GPU queue buffers under
+     * peak cache pressure and freeze generation).  Backends without a
+     * snapshot keep the legacy fixed-fraction budget. */
+    ds4_ssd_host_memory memory;
+    if (e->backend != DS4_BACKEND_METAL &&
+        !ds4_gpu_host_memory_snapshot(&memory)) {
         return ds4_engine_configure_streaming_legacy_auto_cache(e);
     }
 
-    ds4_ssd_host_memory memory;
     if (!ds4_gpu_host_memory_snapshot(&memory)) {
         fprintf(stderr,
                 "ds4: SSD streaming auto cache: host memory snapshot unavailable; "
@@ -31672,9 +31698,9 @@ static bool ds4_engine_qwen35_metal_options_valid(
         const ds4_engine_options *opt,
         bool                      load_slice) {
     if (!e || !opt) return false;
-    if (e->backend != DS4_BACKEND_METAL) {
+    if (!ds4_backend_is_qwen_gpu(e->backend)) {
         fprintf(stderr,
-                "ds4: experimental Qwen Metal inference requires --metal\n");
+                "ds4: experimental Qwen GPU inference requires the graph backend\n");
         return false;
     }
     if (e->quality) {
@@ -31743,7 +31769,7 @@ static bool ds4_engine_qwen35_metal_options_valid(
     return true;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
 static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
     if (!e || e->backend != DS4_BACKEND_METAL ||
         e->residency != DS4_RESIDENCY_SSD || !e->ssd_streaming) {
@@ -31941,7 +31967,7 @@ static bool ds4_engine_configure_qwen35_metal_streaming(ds4_engine *e) {
 }
 
 static bool ds4_engine_configure_qwen35_metal_resident(ds4_engine *e) {
-    if (!e || e->backend != DS4_BACKEND_METAL ||
+    if (!e || !ds4_backend_is_qwen_gpu(e->backend) ||
         e->residency != DS4_RESIDENCY_RESIDENT || e->ssd_streaming ||
         !e->model.map || e->model.tensor_data_pos >= e->model.size) {
         return false;
@@ -31949,7 +31975,7 @@ static bool ds4_engine_configure_qwen35_metal_resident(ds4_engine *e) {
 
     if (!ds4_gpu_init()) {
         fprintf(stderr,
-                "ds4: Metal backend unavailable while initializing Qwen resident mode\n");
+                "ds4: GPU backend unavailable while initializing Qwen resident mode\n");
         return false;
     }
     e->metal_ready = true;
@@ -32150,12 +32176,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 0;
         }
 
-        const char *experimental_metal =
-            getenv("DS4_QWEN_EXPERIMENTAL_METAL");
-        if (!experimental_metal || strcmp(experimental_metal, "1") != 0) {
+#ifdef DS4_ROCM_BUILD
+        const char *experimental_gate = getenv("DS4_QWEN_EXPERIMENTAL_ROCM");
+        const char *experimental_gate_name = "DS4_QWEN_EXPERIMENTAL_ROCM";
+#else
+        const char *experimental_gate = getenv("DS4_QWEN_EXPERIMENTAL_METAL");
+        const char *experimental_gate_name = "DS4_QWEN_EXPERIMENTAL_METAL";
+#endif
+        if (!experimental_gate || strcmp(experimental_gate, "1") != 0) {
             fprintf(stderr,
-                    "ds4: Qwen Metal inference requires "
-                    "DS4_QWEN_EXPERIMENTAL_METAL=1\n");
+                    "ds4: Qwen GPU inference requires %s=1\n",
+                    experimental_gate_name);
             ds4_engine_close(e);
             return 1;
         }
@@ -32164,7 +32195,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             ds4_engine_close(e);
             return 1;
         }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
         if (!ds4_engine_resolve_residency(
                 e, opt, false, 0, 0, false)) {
             ds4_engine_close(e);
@@ -32172,6 +32203,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         vocab_load(&e->vocab, &e->model);
         bool configured = false;
+#ifdef DS4_ROCM_BUILD
+        /* Qwen SSD streaming is not ported to ROCm; the ~19.4 GiB payload is
+         * resident on the 64 GB box, the regime this port targets. */
+        e->residency = DS4_RESIDENCY_RESIDENT;
+        e->ssd_streaming = false;
+        if (opt->warm_weights) model_warm_weights(&e->model);
+        configured = ds4_engine_configure_qwen35_metal_resident(e);
+#else
         if (e->residency == DS4_RESIDENCY_SSD && e->ssd_streaming) {
             if (opt->warm_weights) {
                 fprintf(stderr,
@@ -32185,9 +32224,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             configured =
                 ds4_engine_configure_qwen35_metal_resident(e);
         }
+#endif
         if (!configured) {
             fprintf(stderr,
-                    "ds4: Qwen Metal residency configuration failed for %s mode\n",
+                    "ds4: Qwen GPU residency configuration failed for %s mode\n",
                     ds4_residency_mode_name(e->residency));
             ds4_engine_close(e);
             return 1;
@@ -32195,7 +32235,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->qwen_raw_runtime = true;
         e->qwen_metal_runtime = true;
         fprintf(stderr,
-                "ds4: experimental Qwen Metal %s runtime enabled\n",
+                "ds4: experimental Qwen GPU %s runtime enabled\n",
                 ds4_residency_mode_name(e->residency));
         *out = e;
         return 0;
@@ -32866,7 +32906,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     if (qwen35 && e->backend != DS4_BACKEND_CPU &&
-        !(e->backend == DS4_BACKEND_METAL && e->qwen_metal_runtime)) {
+        !(ds4_backend_is_qwen_gpu(e->backend) && e->qwen_metal_runtime)) {
         fprintf(stderr,
                 "ds4: Qwen session backend does not match its enabled runtime\n");
         return 1;
@@ -32940,7 +32980,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
-#if defined(__APPLE__)
+#ifdef DS4_QWEN_GPU_BUILD
     if (qwen35) {
         s->prefill_cap = 1u;
         if (!qwen35_gpu_graph_alloc(
@@ -33037,7 +33077,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else if (ds4_session_is_qwen35_metal(s)) {
-#if defined(__APPLE__)
+#ifdef DS4_QWEN_GPU_BUILD
         if (getenv("DS4_METAL_MEMORY_REPORT") != NULL) {
             ds4_gpu_print_memory_report("before Qwen graph free");
         }
@@ -33772,7 +33812,7 @@ static int ds4_session_sync_qwen35_with_forward(
     return 0;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
 static bool ds4_session_qwen35_metal_forward_commit(
         ds4_session *s,
         int          token,
@@ -34099,7 +34139,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return ds4_session_sync_qwen35_with_forward(
                 s, prompt, err, errlen, qwen35_cpu_forward_token);
         }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
         if (ds4_session_is_qwen35_metal(s)) {
             return ds4_session_sync_qwen35_metal(
                 s, prompt, err, errlen);
@@ -34519,7 +34559,7 @@ static int ds4_session_eval_qwen35_with_forward(
     return 0;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
 static int ds4_session_eval_qwen35_metal(
         ds4_session *s,
         int          token,
@@ -34584,7 +34624,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return ds4_session_eval_qwen35_with_forward(
                 s, token, err, errlen, qwen35_cpu_forward_token);
         }
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifdef DS4_QWEN_GPU_BUILD
         if (ds4_session_is_qwen35_metal(s)) {
             return ds4_session_eval_qwen35_metal(
                 s, token, err, errlen);

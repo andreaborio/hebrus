@@ -1,10 +1,17 @@
+static cudaEvent_t *selected_readback_event_slot(uint64_t event_value) {
+    if (event_value == 0) return NULL;
+    return &g_selected_readback_events[event_value %
+                                       DS4_SELECTED_READBACK_EVENT_RING];
+}
+
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     if (!event_value) return 0;
     *event_value = 0;
-    if (!g_selected_readback_event) {
+    const uint64_t value = g_selected_readback_event_value + 1;
+    cudaEvent_t *slot = selected_readback_event_slot(value);
+    if (!*slot) {
         cudaError_t err =
-            cudaEventCreateWithFlags(&g_selected_readback_event,
-                                     cudaEventDisableTiming);
+            cudaEventCreateWithFlags(slot, cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX "selected readback event creation failed: %s\n",
@@ -13,7 +20,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
             return 0;
         }
     }
-    cudaError_t err = cudaEventRecord(g_selected_readback_event, 0);
+    cudaError_t err = cudaEventRecord(*slot, 0);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "selected readback event record failed: %s\n",
@@ -21,13 +28,15 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
         (void)cudaGetLastError();
         return 0;
     }
-    *event_value = ++g_selected_readback_event_value;
+    g_selected_readback_event_value = value;
+    *event_value = value;
     return 1;
 }
 
 extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
-    if (event_value == 0 || !g_selected_readback_event) return 0;
-    cudaError_t err = cudaEventSynchronize(g_selected_readback_event);
+    cudaEvent_t *slot = selected_readback_event_slot(event_value);
+    if (!slot || !*slot) return 0;
+    cudaError_t err = cudaEventSynchronize(*slot);
     if (err != cudaSuccess) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "selected readback wait failed for %s: %s\n",
@@ -50,10 +59,10 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(
         uint64_t bytes,
         uint64_t event_value,
         const char *label) {
+    cudaEvent_t *slot = selected_readback_event_slot(event_value);
     if (!tensor || !data || offset > tensor->bytes ||
         bytes > tensor->bytes - offset ||
-        event_value == 0 ||
-        !g_selected_readback_event) {
+        !slot || !*slot) {
         return 0;
     }
     if (!g_selected_readback_stream) {
@@ -68,18 +77,21 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(
             return 0;
         }
     }
-#ifdef __HIP_PLATFORM_AMD__
-    cudaError_t err = hipStreamWaitEvent(g_selected_readback_stream,
-                                         g_selected_readback_event,
-                                         0);
-#else
-    cudaError_t err = cudaStreamWaitEvent(g_selected_readback_stream,
-                                          g_selected_readback_event,
-                                          0);
-#endif
+    /*
+     * Wait for the router's event on the HOST, not with a device-side
+     * hipStreamWaitEvent barrier.  On this ROCm/APU stack a pending
+     * stream-wait barrier occasionally misses its signal and wedges the HSA
+     * hardware queue it occupies; every stream multiplexed onto that queue
+     * (including the pinned-staging upload streams) then stalls behind it and
+     * the process deadlocks in cudaStreamSynchronize/cudaDeviceSynchronize
+     * with an idle GPU.  A host-side event wait provides the same ordering
+     * guarantee (the copy below starts only after the router output is
+     * complete) without enqueueing any device-side dependency.
+     */
+    cudaError_t err = cudaEventSynchronize(*slot);
     if (err != cudaSuccess) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "selected readback stream wait failed for %s: %s\n",
+                DS4_GPU_LOG_PREFIX "selected readback event wait failed for %s: %s\n",
                 label ? label : "selected-id readback",
                 cudaGetErrorString(err));
         (void)cudaGetLastError();
@@ -174,9 +186,23 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_cache_budget = experts;
 }
 
+/* Fail-closed correctness floor from the adaptive planner (ds4_ssd.c).  The
+ * ROCm cache does not yet shrink under live pressure the way Metal does, so
+ * the floor currently guards only the startup budget; storing it keeps the
+ * model contract visible to shared engine code and future enforcement. */
+static uint32_t g_stream_expert_cache_required_floor;
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_required_floor(
         uint32_t experts) {
-    (void)experts;
+    g_stream_expert_cache_required_floor = experts;
+    if (experts != 0 && g_stream_expert_cache_budget != 0 &&
+        g_stream_expert_cache_budget < experts) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "streaming expert cache budget %u is below "
+                "the model's correctness floor %u\n",
+                g_stream_expert_cache_budget,
+                experts);
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -199,9 +225,93 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b;
 }
 
+/*
+ * Linux/ROCm host memory snapshot for the adaptive SSD expert-cache planner.
+ *
+ * Field mapping from the Darwin collector (ds4_metal.m) to Linux sources:
+ *   physical_bytes     <- /proc/meminfo MemTotal
+ *   recommended_bytes  <- hipMemGetInfo() total: on UMA APUs the GTT pool is
+ *                         the platform's working-set envelope, the closest
+ *                         analogue of recommendedMaxWorkingSetSize
+ *   task_footprint     <- /proc/self/status VmRSS
+ *   free_bytes         <- MemFree (MemAvailable would double-count the
+ *                         file-backed credit the planner adds separately)
+ *   purgeable_bytes    <- 0 (no Linux analogue)
+ *   inactive_bytes     <- Inactive(file): reclaimable page-cache, the
+ *                         conservative counterpart of Mach inactive_count
+ *   file_backed_bytes  <- Cached
+ *   pressure_normal    <- PSI /proc/pressure/memory, "some avg10" < 5.0
+ *
+ * Motivating failure (Radeon 780M, 64 GB, GTT 48 GiB): with the legacy fixed
+ * pool/8 floor the expert cache peaked after ~150-250 generated tokens and
+ * the kernel TTM evicted the GPU queue buffers themselves — dmesg shows
+ * "Not enough memory for command submission!" and "Freeing queue vital
+ * buffer, queue evicted" — freezing generation with an idle GPU.  A
+ * host-aware budget prevents it; this snapshot is what the planner needs to
+ * compute one.
+ */
 extern "C" int ds4_gpu_host_memory_snapshot(ds4_ssd_host_memory *out) {
-    if (out) memset(out, 0, sizeof(*out));
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+#if !defined(__linux__)
     return 0;
+#else
+    size_t gtt_free = 0;
+    size_t gtt_total = 0;
+    if (cudaMemGetInfo(&gtt_free, &gtt_total) != cudaSuccess || gtt_total == 0) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    uint64_t mem_total = 0, mem_free = 0, inactive_file = 0, cached = 0;
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (!mi) return 0;
+    char line[160];
+    while (fgets(line, sizeof(line), mi)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) mem_total = (uint64_t)kb << 10;
+        else if (sscanf(line, "MemFree: %llu kB", &kb) == 1) mem_free = (uint64_t)kb << 10;
+        else if (sscanf(line, "Inactive(file): %llu kB", &kb) == 1) inactive_file = (uint64_t)kb << 10;
+        else if (sscanf(line, "Cached: %llu kB", &kb) == 1) cached = (uint64_t)kb << 10;
+    }
+    fclose(mi);
+    if (mem_total == 0) return 0;
+
+    uint64_t vm_rss = 0;
+    FILE *st = fopen("/proc/self/status", "r");
+    if (st) {
+        while (fgets(line, sizeof(line), st)) {
+            unsigned long long kb = 0;
+            if (sscanf(line, "VmRSS: %llu kB", &kb) == 1) {
+                vm_rss = (uint64_t)kb << 10;
+                break;
+            }
+        }
+        fclose(st);
+    }
+
+    out->physical_bytes = mem_total;
+    out->recommended_bytes = (uint64_t)gtt_total;
+    out->task_footprint_bytes = vm_rss;
+    out->free_bytes = mem_free;
+    out->purgeable_bytes = 0;
+    out->inactive_bytes = inactive_file;
+    out->file_backed_bytes = cached;
+
+    FILE *psi = fopen("/proc/pressure/memory", "r");
+    if (psi) {
+        while (fgets(line, sizeof(line), psi)) {
+            float avg10 = 0.0f;
+            if (sscanf(line, "some avg10=%f", &avg10) == 1) {
+                out->pressure_status_available = true;
+                out->pressure_normal = avg10 < 5.0f;
+                break;
+            }
+        }
+        fclose(psi);
+    }
+    return 1;
+#endif
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
@@ -358,4 +468,17 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
     }
     g_routed_moe_selected_override_n = n_selected;
     return 1;
+}
+
+/* Documented contract (ds4_gpu.h): zero on non-Metal backends. The ROCm
+ * runtime keeps its own optional counters behind DS4_ROCM_STREAM_CACHE_STATS;
+ * wiring them here is future work. */
+extern "C" void ds4_gpu_stream_expert_cache_stats(
+        uint64_t *hits, uint64_t *misses, uint64_t *pread_bytes,
+        double *pread_ms, double *split_resident_wait_ms) {
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+    if (pread_bytes) *pread_bytes = 0;
+    if (pread_ms) *pread_ms = 0.0;
+    if (split_resident_wait_ms) *split_resident_wait_ms = 0.0;
 }

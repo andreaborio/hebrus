@@ -990,11 +990,29 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
             cuda_model_range_ptr(model_map, out_b_offset, out_b_bytes, "attn_out_b"));
     if (!out_a || !out_b) return 0;
 
+    /* NOTE: routing small streaming batches (MTP verify) through the cublas
+     * f16 branch was tried (DS4_ROCM_ATTN_OUT_FAST_BATCH) and reverted: it
+     * halved this projection's cost but reintroduced the intermittent HSA
+     * queue wedge under multi-stream load.  The q8 small-n ntok kernels give
+     * most of the win with none of the fragility. */
     const int attn_output_cublas =
         cuda_runtime_config()->attention_output_cublas_all &&
         (n_tokens == 1u || !g_ssd_streaming_mode);
     if (!attn_output_cublas) {
-        if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
+        const int outproj_profile = getenv("DS4_ROCM_ATTN_OUT_PROFILE") != NULL;
+        double outproj_t0 = 0.0;
+        if (outproj_profile) {
+            (void)cudaDeviceSynchronize();
+            outproj_t0 = cuda_wall_sec();
+        }
+        /* Same small-batch dispatch rationale as cuda_matmul_q8_0_tensor_labeled:
+         * the grouped sharedx kernel tiles 16 tokens per block and wastes most
+         * of the tile on MTP verify suffixes (n_tokens 2-5). */
+        const int smalln_warp8 =
+            n_tokens > 1u && n_tokens < 8u &&
+            getenv("DS4_ROCM_SMALLN_SHAREDX") == NULL;
+        if (!smalln_warp8 &&
+            (group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
             const uint32_t tile = 32u;
             const uint32_t block_tile = 16u;
@@ -1022,6 +1040,26 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     blocks_a);
         }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a f32 batch launch")) return 0;
+        if (outproj_profile) {
+            (void)cudaDeviceSynchronize();
+            const double t_a = cuda_wall_sec();
+            const int rc = cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size,
+                                                           out_b_offset, low_dim, out_dim,
+                                                           low, n_tokens, "attn_output_b");
+            (void)cudaDeviceSynchronize();
+            const double t_b = cuda_wall_sec();
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "attn_out profile tokens=%u a=%.3f ms b=%.3f ms "
+                    "(low_dim=%llu out_dim=%llu groups=%u gdim=%llu)\n",
+                    n_tokens,
+                    (t_a - outproj_t0) * 1000.0,
+                    (t_b - t_a) * 1000.0,
+                    (unsigned long long)low_dim,
+                    (unsigned long long)out_dim,
+                    n_groups,
+                    (unsigned long long)group_dim);
+            return rc;
+        }
         return cuda_matmul_q8_0_tensor_labeled(out,
                                                model_map,
                                                model_size,

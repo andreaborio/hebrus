@@ -18,7 +18,10 @@ DEPFLAGS ?= -MMD -MP
 
 BUILD_GIT_SHA ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_GIT_SUFFIX ?= $(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '%s' -dirty)
-CFLAGS += -DDS4_BUILD_GIT_SHA=\"$(BUILD_GIT_SHA)$(BUILD_GIT_SUFFIX)\"
+# Pass the sha as a bare token and stringify it in ds4_build.c: a quoted
+# -D value does not survive the extra shell evaluation in recursive targets
+# (strix-halo/cuda pass CFLAGS="$(CFLAGS) ..." through $(MAKE)).
+CFLAGS += -DDS4_BUILD_GIT_SHA=$(BUILD_GIT_SHA)$(BUILD_GIT_SUFFIX)
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
