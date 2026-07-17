@@ -34128,11 +34128,18 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         return true;
     }
 
-    if (e->backend != DS4_BACKEND_METAL) {
+    /* The adaptive planner is capability-gated, not backend-gated: any
+     * backend that can produce a live host-memory snapshot gets the adaptive
+     * budget (ROCm UMA APUs need it as much as Metal does — without a
+     * host-aware floor the kernel TTM can evict the GPU queue buffers under
+     * peak cache pressure and freeze generation).  Backends without a
+     * snapshot keep the legacy fixed-fraction budget. */
+    ds4_ssd_host_memory memory;
+    if (e->backend != DS4_BACKEND_METAL &&
+        !ds4_gpu_host_memory_snapshot(&memory)) {
         return ds4_engine_configure_streaming_legacy_auto_cache(e);
     }
 
-    ds4_ssd_host_memory memory;
     if (!ds4_gpu_host_memory_snapshot(&memory)) {
         fprintf(stderr,
                 "ds4: SSD streaming auto cache: host memory snapshot unavailable; "
