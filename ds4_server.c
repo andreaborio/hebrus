@@ -11165,7 +11165,16 @@ static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish,
                                                 ds4_chat_format format) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    /* Tools offered but never used must not cost a full re-prefill.  The call
+     * site already excludes turns that sampled tool calls (!parsed_calls.len),
+     * so this guard only covers "the request carried tool definitions".  For
+     * Qwen the reuse path additionally proves an exact token prefix of the
+     * remembered visible tokens before continuing, so a tools-present prompt
+     * that renders differently fails closed into ordinary token/text/disk
+     * matching.  Agentic clients (OpenCode) pass tools on every turn and answer
+     * with text most turns; without this the whole prompt is re-prefilled. */
+    if (r->has_tools && format != DS4_CHAT_FORMAT_QWEN36) return false;
     if (r->prompt_preserves_reasoning) return false;
     /* Qwen's no-thinking generation prefix still contains a trusted
      * <think>...</think> wrapper that the next canonical history omits. */
